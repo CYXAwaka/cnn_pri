@@ -3,6 +3,7 @@
 import copy
 import csv
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -51,7 +52,7 @@ def create_run_id(result_dir: str) -> tuple[str, Path]:
 
 
 def selection_tuple(metrics: dict[str, float]) -> tuple[float, float, float, float, float]:
-    """Primary then tie-break: AUC -> MAP@100 -> MAP@200 -> Recall -> Precision."""
+    """Primary then tie-break: AUC -> Recall -> MAP@100 -> MAP@200 -> Precision."""
 
     def _safe(v: float) -> float:
         if v is None or (isinstance(v, float) and np.isnan(v)):
@@ -60,9 +61,9 @@ def selection_tuple(metrics: dict[str, float]) -> tuple[float, float, float, flo
 
     return (
         _safe(metrics.get("auc", float("nan"))),
+        _safe(metrics.get("recall", float("nan"))),
         _safe(metrics.get("map100", float("nan"))),
         _safe(metrics.get("map200", float("nan"))),
-        _safe(metrics.get("recall", float("nan"))),
         _safe(metrics.get("precision", float("nan"))),
     )
 
@@ -156,6 +157,7 @@ def _run_epoch(
     criterion,
     device: str,
     optimizer=None,
+    grad_clip_norm: float | None = None,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     is_train = optimizer is not None
     if is_train:
@@ -180,6 +182,8 @@ def _run_epoch(
             if is_train:
                 optimizer.zero_grad()
                 loss.backward()
+                if grad_clip_norm is not None and grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
                 optimizer.step()
 
             total_loss += float(loss.item())
@@ -207,6 +211,10 @@ def train_wdcnn_model(
     min_lr: float,
     checkpoint_path: str,
     threshold_metric: str = "f1",
+    fixed_val_threshold: float | None = None,
+    use_cosine_schedule: bool = False,
+    warmup_epochs: int = 0,
+    grad_clip_norm: float | None = None,
 ) -> TrainingOutput:
     train_labels = []
     for _, _, y in train_loader:
@@ -219,13 +227,33 @@ def train_wdcnn_model(
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=scheduler_factor,
-        patience=scheduler_patience,
-        min_lr=min_lr,
-    )
+    scheduler_mode = "plateau"
+    if use_cosine_schedule:
+        total_epochs = max(int(max_epochs), 1)
+        warm = max(int(warmup_epochs), 0)
+        base_lr = max(float(lr), 1e-12)
+        min_factor = float(np.clip(min_lr / base_lr, 0.0, 1.0))
+
+        def _lr_lambda(epoch_zero_idx: int) -> float:
+            ep = epoch_zero_idx + 1
+            if warm > 0 and ep <= warm:
+                return 0.25 + 0.75 * (ep / float(warm))
+
+            progress = (ep - warm) / float(max(total_epochs - warm, 1))
+            progress = float(np.clip(progress, 0.0, 1.0))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_factor + (1.0 - min_factor) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+        scheduler_mode = "cosine"
+    else:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=scheduler_factor,
+            patience=scheduler_patience,
+            min_lr=min_lr,
+        )
 
     history: dict[str, list[float]] = {
         "train_loss": [],
@@ -243,6 +271,7 @@ def train_wdcnn_model(
         "train_f1": [],
         "val_f1": [],
         "val_threshold": [],
+        "lr": [],
     }
 
     best_epoch = 0
@@ -253,14 +282,27 @@ def train_wdcnn_model(
     stale_epochs = 0
 
     for epoch in range(1, max_epochs + 1):
-        train_loss, y_train, p_train = _run_epoch(model, train_loader, criterion, device, optimizer=optimizer)
+        train_loss, y_train, p_train = _run_epoch(
+            model,
+            train_loader,
+            criterion,
+            device,
+            optimizer=optimizer,
+            grad_clip_norm=grad_clip_norm,
+        )
         val_loss, y_val, p_val = _run_epoch(model, val_loader, criterion, device, optimizer=None)
 
-        val_threshold = select_best_threshold(y_val, p_val, metric=threshold_metric)
+        if fixed_val_threshold is None:
+            val_threshold = select_best_threshold(y_val, p_val, metric=threshold_metric)
+        else:
+            val_threshold = float(fixed_val_threshold)
         train_metrics = compute_binary_metrics(y_train, p_train, threshold=0.5)
         val_metrics = compute_binary_metrics(y_val, p_val, threshold=val_threshold)
 
-        scheduler.step(val_loss)
+        if scheduler_mode == "cosine":
+            scheduler.step()
+        else:
+            scheduler.step(val_loss)
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
@@ -277,13 +319,15 @@ def train_wdcnn_model(
         history["train_f1"].append(train_metrics["f1"])
         history["val_f1"].append(val_metrics["f1"])
         history["val_threshold"].append(val_threshold)
+        history["lr"].append(float(optimizer.param_groups[0]["lr"]))
 
         print(
             f"[WDCNN] Epoch {epoch:03d} | "
             f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} | "
             f"val_auc={val_metrics['auc']:.4f} val_map100={val_metrics['map100']:.4f} "
             f"val_map200={val_metrics['map200']:.4f} val_recall={val_metrics['recall']:.4f} "
-            f"val_precision={val_metrics['precision']:.4f} thr={val_threshold:.2f}"
+            f"val_precision={val_metrics['precision']:.4f} thr={val_threshold:.2f} "
+            f"lr={optimizer.param_groups[0]['lr']:.6f}"
         )
 
         cur_score = selection_tuple(val_metrics)

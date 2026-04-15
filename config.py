@@ -68,6 +68,23 @@ class Config:
     artifact_versioning: str = "timestamp+version"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Resume controls
+    resume_run_id: str = "20260414_190010_v001"
+    resume_skip_existing: bool = True
+    resume_rebuild_metrics: bool = True
+    resume_scan_only: bool = False
+
+    # Best-group smooth retrain controls
+    smooth_target_run_id: str = "20260414_190010_v001"
+    smooth_lr: float = 6e-4
+    smooth_max_epochs: int = 24
+    smooth_early_stop_patience: int = 10
+    smooth_warmup_epochs: int = 3
+    smooth_use_cosine_schedule: bool = True
+    smooth_grad_clip_norm: float = 1.0
+    smooth_fixed_threshold: float | None = 0.73
+    smooth_artifact_suffix: str = "smooth"
+
     def make_dirs(self) -> None:
         Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         Path(self.result_dir).mkdir(parents=True, exist_ok=True)
