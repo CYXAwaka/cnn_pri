@@ -151,6 +151,31 @@ def select_best_threshold(y_true: np.ndarray, y_prob: np.ndarray, metric: str = 
     return best_thr
 
 
+def select_threshold_with_precision_floor(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    precision_floor: float,
+    fallback_metric: str = "f1",
+) -> float:
+    """Pick threshold by max Recall under Precision floor; fallback to metric-optimal threshold."""
+    candidates = np.linspace(0.05, 0.95, 91)
+    eligible: list[tuple[float, float, float, float]] = []  # recall, f1, precision, threshold
+
+    for thr in candidates:
+        y_pred = (y_prob >= thr).astype(int)
+        prec = float(precision_score(y_true, y_pred, zero_division=0))
+        rec = float(recall_score(y_true, y_pred, zero_division=0))
+        f1 = float(f1_score(y_true, y_pred, zero_division=0))
+        if prec >= float(precision_floor):
+            eligible.append((rec, f1, prec, float(thr)))
+
+    if eligible:
+        eligible.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        return float(eligible[0][3])
+
+    return select_best_threshold(y_true, y_prob, metric=fallback_metric)
+
+
 def _run_epoch(
     model: nn.Module,
     dataloader,
@@ -215,6 +240,8 @@ def train_wdcnn_model(
     use_cosine_schedule: bool = False,
     warmup_epochs: int = 0,
     grad_clip_norm: float | None = None,
+    pos_weight_scale: float = 1.0,
+    precision_floor: float | None = None,
 ) -> TrainingOutput:
     train_labels = []
     for _, _, y in train_loader:
@@ -223,7 +250,7 @@ def train_wdcnn_model(
 
     pos = max(int(np.sum(train_labels == 1)), 1)
     neg = max(int(np.sum(train_labels == 0)), 1)
-    pos_weight = torch.tensor([neg / pos], dtype=torch.float32, device=device)
+    pos_weight = torch.tensor([float(neg / pos) * float(pos_weight_scale)], dtype=torch.float32, device=device)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -292,10 +319,17 @@ def train_wdcnn_model(
         )
         val_loss, y_val, p_val = _run_epoch(model, val_loader, criterion, device, optimizer=None)
 
-        if fixed_val_threshold is None:
-            val_threshold = select_best_threshold(y_val, p_val, metric=threshold_metric)
-        else:
+        if fixed_val_threshold is not None:
             val_threshold = float(fixed_val_threshold)
+        elif precision_floor is not None:
+            val_threshold = select_threshold_with_precision_floor(
+                y_true=y_val,
+                y_prob=p_val,
+                precision_floor=float(precision_floor),
+                fallback_metric=threshold_metric,
+            )
+        else:
+            val_threshold = select_best_threshold(y_val, p_val, metric=threshold_metric)
         train_metrics = compute_binary_metrics(y_train, p_train, threshold=0.5)
         val_metrics = compute_binary_metrics(y_val, p_val, threshold=val_threshold)
 

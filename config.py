@@ -85,6 +85,19 @@ class Config:
     smooth_fixed_threshold: float | None = 0.73
     smooth_artifact_suffix: str = "smooth"
 
+    # Smooth-v2 (AUC first, Recall second, Precision floor) search controls
+    smooth_v1_run_id: str = "20260415_175252_v001"
+    smooth_v2_result_subdir: str = "smooth_v2"
+    smooth_v2_ratio: float = 0.8
+    smooth_v2_param_tag: str = "a90_b120_g20_r3"
+    smooth_v2_precision_floor: float = 0.30
+    smooth_v2_stage_a_lrs: list[float] = field(default_factory=lambda: [4e-4, 6e-4, 8e-4])
+    smooth_v2_stage_a_warmups: list[int] = field(default_factory=lambda: [1, 2, 3])
+    smooth_v2_stage_a_patience: list[int] = field(default_factory=lambda: [6, 8])
+    smooth_v2_stage_a_max_epochs: int = 20
+    smooth_v2_stage_a_top_k: int = 2
+    smooth_v2_stage_b_pos_weight_scales: list[float] = field(default_factory=lambda: [1.0, 1.2, 1.4])
+
     def make_dirs(self) -> None:
         Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         Path(self.result_dir).mkdir(parents=True, exist_ok=True)
