@@ -1,135 +1,335 @@
-
-"""
-main_cnn_lg.py
-~~~~~~~~~~~~~~
-这是 CNN-LG 的总入口。
-
-这个文件刻意写得比较“流程化”，方便你理解：
-1. 加载配置
-2. 做数据预处理
-3. 建 CNN 特征提取器
-4. 用 CNN 做预训练
-5. 提取 64 维特征
-6. 训练 LightGBM
-7. 评估并保存结果
-
-你可以把这个文件理解为“总调度中心”。
-"""
+﻿from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import torch
 
-# 对于部分 Windows / CPU 环境，PyTorch 在线程数过多时可能出现训练非常慢的情况。
-# 这里主动限制线程数，让小项目运行更稳定。
+from config import config
+from data_process import preprocess_for_wdcnn, split_dataset_for_ratio
+from engine import (
+    create_run_id,
+    evaluate_wdcnn_model,
+    plot_roc_pr_curves,
+    plot_topn_precision_curve,
+    plot_training_history,
+    save_json,
+    save_metrics_text,
+    save_records_csv,
+    selection_tuple,
+    summarize_metrics,
+    train_wdcnn_model,
+)
+from src.models.wdcnn_model import WideDeepCNN
+
+# Keep CPU runtime stable on some Windows environments.
 torch.set_num_threads(1)
 try:
     torch.set_num_interop_threads(1)
 except Exception:
     pass
 
-from config import config
-from data_process import preprocess_for_cnn_lg
-from engine import (
-    evaluate_lightgbm,
-    extract_features,
-    plot_training_history,
-    save_lightgbm_model,
-    save_metrics_text,
-    train_cnn_feature_extractor,
-    train_lightgbm_classifier,
-)
-from src.models.cnn_lg_model import CNNFeatureExtractor, CNNPretrainClassifier
+
+def ratio_tag(ratio: float) -> str:
+    return f"r{int(round(ratio * 100)):02d}"
 
 
-def main():
-    # 1. 创建输出目录
+def param_tag(params: dict[str, int | float]) -> str:
+    return f"a{params['alpha']}_b{params['beta']}_g{params['gamma']}_r{params['r_layers']}"
+
+
+def build_model(split, params: dict[str, int | float]) -> WideDeepCNN:
+    return WideDeepCNN(
+        wide_input_dim=split.wide_input_dim,
+        deep_input_shape=split.deep_input_shape,
+        alpha=int(params["alpha"]),
+        beta=int(params["beta"]),
+        gamma=int(params["gamma"]),
+        r_layers=int(params["r_layers"]),
+        dropout=float(params["dropout"]),
+    )
+
+
+def main() -> None:
     config.make_dirs()
 
-    print(f"当前设备: {config.device}")
+    run_id, run_dir = create_run_id(config.result_dir)
+    checkpoint_dir = Path(config.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2. 数据预处理
-    prepared = preprocess_for_cnn_lg(
+    print(f"Device: {config.device}")
+    print(f"Run ID: {run_id}")
+    print(f"Run Dir: {run_dir}")
+
+    dataset = preprocess_for_wdcnn(
         file_path=config.data_path,
         id_col=config.id_col,
         label_col=config.label_col,
-        missing_threshold=config.missing_threshold,
-        use_outlier_repair=config.use_outlier_repair,
         days_per_week=config.days_per_week,
-        target_weeks=config.target_weeks,
-        train_ratio=config.train_ratio,
-        val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio,
-        batch_size=config.batch_size,
-        random_state=config.random_state,
-        use_random_oversample=config.use_random_oversample,
+        fill_missing_calendar_days=config.fill_missing_calendar_days,
+        use_outlier_clip=config.use_outlier_clip,
+        outlier_sigma_k=config.outlier_sigma_k,
+        normalize_eps=config.normalize_eps,
+        week_pad_value=config.week_pad_value,
     )
 
-    # 3. 创建 CNN 特征提取器
-    feature_extractor = CNNFeatureExtractor(
-        input_shape=prepared.input_shape,
-        in_channels=config.in_channels,
-        conv_channels=config.conv_channels,
-        kernel_size=config.conv_kernel_size,
-        pool1_kernel_size=config.pool1_kernel_size,
-        pool1_stride=config.pool1_stride,
-        pool2_kernel_size=config.pool2_kernel_size,
-        pool2_stride=config.pool2_stride,
-        fc_dim=config.fc_dim,
-        dropout=config.dropout,
-    )
-    model = CNNPretrainClassifier(feature_extractor, num_classes=config.num_classes)
-    model = model.to(config.device)
+    coarse_records: list[dict] = []
+    fine_records: list[dict] = []
+    ratio_summary_records: list[dict] = []
 
-    # 4. CNN 预训练
-    best_cnn_path = str(Path(config.checkpoint_dir) / "best_cnn_pretrain.pth")
-    model, history = train_cnn_feature_extractor(
-        model=model,
-        train_loader=prepared.train_loader,
-        val_loader=prepared.val_loader,
-        device=config.device,
-        lr=config.cnn_lr,
-        weight_decay=config.weight_decay,
-        epochs=config.cnn_epochs,
-        patience=config.early_stop_patience,
-        checkpoint_path=best_cnn_path,
-    )
+    coarse_grid = config.coarse_param_grid()
+    primary_seed = config.seed_list[0]
 
-    # 5. 提取特征
-    X_train_feat, y_train = extract_features(model, prepared.train_loader, config.device)
-    X_val_feat, y_val = extract_features(model, prepared.val_loader, config.device)
-    X_test_feat, y_test = extract_features(model, prepared.test_loader, config.device)
+    for tr in config.train_ratios:
+        r_tag = ratio_tag(tr)
+        print("\n" + "=" * 88)
+        print(f"[Ratio {tr:.2f}] Stage-1 coarse search start")
+        print("=" * 88)
 
-    print(f"提取后的特征维度: {X_train_feat.shape[1]}")
+        coarse_split = split_dataset_for_ratio(
+            dataset=dataset,
+            train_ratio=tr,
+            val_ratio_in_train=config.val_ratio_in_train,
+            batch_size=config.batch_size,
+            random_state=primary_seed,
+            num_workers=config.num_workers,
+        )
 
-    # 6. 训练 LightGBM
-    lgbm_model = train_lightgbm_classifier(
-        X_train_feat=X_train_feat,
-        y_train=y_train,
-        params=config.lgbm_params,
-    )
+        ratio_coarse: list[dict] = []
+        for i, params in enumerate(coarse_grid, start=1):
+            p_tag = param_tag(params)
+            print(f"[Coarse {i:03d}/{len(coarse_grid):03d}] ratio={tr:.2f} params={p_tag}")
 
-    # 7. 评估
-    val_metrics = evaluate_lightgbm(lgbm_model, X_val_feat, y_val)
-    test_metrics = evaluate_lightgbm(lgbm_model, X_test_feat, y_test)
+            model = build_model(coarse_split, params).to(config.device)
+            ckpt_path = str(
+                checkpoint_dir
+                / f"wdcnn_{run_id}_{r_tag}_{p_tag}_seed{primary_seed}_coarse.pth"
+            )
 
-    print("\n========== 验证集指标 ==========")
-    for k, v in val_metrics.items():
-        print(f"{k}: {v}")
+            train_out = train_wdcnn_model(
+                model=model,
+                train_loader=coarse_split.train_loader,
+                val_loader=coarse_split.val_loader,
+                device=config.device,
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+                max_epochs=config.coarse_max_epochs,
+                early_stop_patience=config.early_stop_patience,
+                scheduler_factor=config.lr_scheduler_factor,
+                scheduler_patience=config.lr_scheduler_patience,
+                min_lr=config.min_lr,
+                checkpoint_path=ckpt_path,
+                threshold_metric=config.threshold_metric,
+            )
 
-    print("\n========== 测试集指标 ==========")
-    for k, v in test_metrics.items():
-        print(f"{k}: {v}")
+            row = {
+                "run_id": run_id,
+                "stage": "coarse",
+                "train_ratio": tr,
+                "seed": primary_seed,
+                "alpha": params["alpha"],
+                "beta": params["beta"],
+                "gamma": params["gamma"],
+                "r_layers": params["r_layers"],
+                "best_epoch": train_out.best_epoch,
+                "best_threshold": train_out.best_threshold,
+                **{f"val_{k}": v for k, v in train_out.best_val_metrics.items()},
+            }
+            coarse_records.append(row)
+            ratio_coarse.append(row)
 
-    # 8. 保存模型和结果
-    save_lightgbm_model(lgbm_model, str(Path(config.checkpoint_dir) / "best_lightgbm.pkl"))
-    plot_training_history(history, str(Path(config.result_dir) / "cnn_pretrain_history.png"))
-    save_metrics_text(
-        {"val_metrics": val_metrics, "test_metrics": test_metrics},
-        str(Path(config.result_dir) / "cnn_lg_metrics.txt")
-    )
+        ratio_coarse_sorted = sorted(
+            ratio_coarse,
+            key=lambda x: selection_tuple(
+                {
+                    "auc": x.get("val_auc", float("nan")),
+                    "map100": x.get("val_map100", float("nan")),
+                    "map200": x.get("val_map200", float("nan")),
+                    "recall": x.get("val_recall", float("nan")),
+                    "precision": x.get("val_precision", float("nan")),
+                }
+            ),
+            reverse=True,
+        )
 
-    print("\nCNN-LG 训练和评估已完成。")
+        top_param_rows = ratio_coarse_sorted[: config.refine_top_k]
+        top_params = [
+            {
+                "alpha": int(r["alpha"]),
+                "beta": int(r["beta"]),
+                "gamma": int(r["gamma"]),
+                "r_layers": int(r["r_layers"]),
+                "dropout": config.dropout,
+            }
+            for r in top_param_rows
+        ]
+
+        print(f"\n[Ratio {tr:.2f}] Stage-2 fine training on top-{len(top_params)} configs")
+
+        param_to_seed_rows: dict[str, list[dict]] = {}
+
+        for params in top_params:
+            p_tag = param_tag(params)
+            param_to_seed_rows[p_tag] = []
+
+            for seed in config.seed_list:
+                split = split_dataset_for_ratio(
+                    dataset=dataset,
+                    train_ratio=tr,
+                    val_ratio_in_train=config.val_ratio_in_train,
+                    batch_size=config.batch_size,
+                    random_state=seed,
+                    num_workers=config.num_workers,
+                )
+
+                model = build_model(split, params).to(config.device)
+                ckpt_path = str(checkpoint_dir / f"wdcnn_{run_id}_{r_tag}_{p_tag}_seed{seed}_fine.pth")
+
+                train_out = train_wdcnn_model(
+                    model=model,
+                    train_loader=split.train_loader,
+                    val_loader=split.val_loader,
+                    device=config.device,
+                    lr=config.lr,
+                    weight_decay=config.weight_decay,
+                    max_epochs=config.fine_max_epochs,
+                    early_stop_patience=config.early_stop_patience,
+                    scheduler_factor=config.lr_scheduler_factor,
+                    scheduler_patience=config.lr_scheduler_patience,
+                    min_lr=config.min_lr,
+                    checkpoint_path=ckpt_path,
+                    threshold_metric=config.threshold_metric,
+                )
+
+                test_metrics, y_test, p_test = evaluate_wdcnn_model(
+                    train_out.model,
+                    split.test_loader,
+                    device=config.device,
+                    threshold=train_out.best_threshold,
+                )
+
+                val_metrics = train_out.best_val_metrics
+
+                tag = f"{r_tag}_{p_tag}_seed{seed}_{run_id}"
+                history_path = run_dir / f"history_{tag}.png"
+                roc_path = run_dir / f"roc_{tag}.png"
+                pr_path = run_dir / f"pr_{tag}.png"
+                topn_path = run_dir / f"topn_{tag}.png"
+                metrics_text_path = run_dir / f"metrics_{tag}.txt"
+                metrics_json_path = run_dir / f"metrics_{tag}.json"
+
+                plot_training_history(train_out.history, str(history_path))
+                plot_roc_pr_curves(y_test, p_test, str(roc_path), str(pr_path))
+                plot_topn_precision_curve(y_test, p_test, str(topn_path), max_n=200)
+
+                seed_payload = {
+                    "run_id": run_id,
+                    "stage": "fine",
+                    "train_ratio": tr,
+                    "seed": seed,
+                    "params": params,
+                    "best_epoch": train_out.best_epoch,
+                    "best_threshold": train_out.best_threshold,
+                    "val_metrics": val_metrics,
+                    "test_metrics": test_metrics,
+                    "artifacts": {
+                        "checkpoint": ckpt_path,
+                        "history": str(history_path),
+                        "roc": str(roc_path),
+                        "pr": str(pr_path),
+                        "topn": str(topn_path),
+                    },
+                }
+
+                save_metrics_text(seed_payload, str(metrics_text_path))
+                save_json(seed_payload, str(metrics_json_path))
+
+                row = {
+                    "run_id": run_id,
+                    "stage": "fine",
+                    "train_ratio": tr,
+                    "seed": seed,
+                    "alpha": params["alpha"],
+                    "beta": params["beta"],
+                    "gamma": params["gamma"],
+                    "r_layers": params["r_layers"],
+                    "best_epoch": train_out.best_epoch,
+                    "best_threshold": train_out.best_threshold,
+                    **{f"val_{k}": v for k, v in val_metrics.items()},
+                    **{f"test_{k}": v for k, v in test_metrics.items()},
+                    "metrics_text": str(metrics_text_path),
+                    "metrics_json": str(metrics_json_path),
+                }
+                fine_records.append(row)
+                param_to_seed_rows[p_tag].append(row)
+
+        # Pick best param by mean validation metrics across seeds.
+        best_param_tag = None
+        best_param_score = selection_tuple({})
+        best_param_rows: list[dict] = []
+
+        for p_tag, rows in param_to_seed_rows.items():
+            mean_val = {
+                "auc": float(np.mean([r.get("val_auc", np.nan) for r in rows])),
+                "map100": float(np.mean([r.get("val_map100", np.nan) for r in rows])),
+                "map200": float(np.mean([r.get("val_map200", np.nan) for r in rows])),
+                "recall": float(np.mean([r.get("val_recall", np.nan) for r in rows])),
+                "precision": float(np.mean([r.get("val_precision", np.nan) for r in rows])),
+            }
+            sc = selection_tuple(mean_val)
+            if sc > best_param_score:
+                best_param_score = sc
+                best_param_tag = p_tag
+                best_param_rows = rows
+
+        metric_keys = ["test_auc", "test_map100", "test_map200", "test_recall", "test_precision", "test_f1"]
+        test_summary = summarize_metrics(best_param_rows, metric_keys)
+
+        ratio_summary = {
+            "run_id": run_id,
+            "train_ratio": tr,
+            "best_param_tag": best_param_tag,
+            "num_seed_runs": len(best_param_rows),
+            **{f"{k}_mean": v["mean"] for k, v in test_summary.items()},
+            **{f"{k}_std": v["std"] for k, v in test_summary.items()},
+        }
+        ratio_summary_records.append(ratio_summary)
+
+        print(f"[Ratio {tr:.2f}] best config={best_param_tag}")
+        for mk in metric_keys:
+            mean_v = ratio_summary.get(f"{mk}_mean", float("nan"))
+            std_v = ratio_summary.get(f"{mk}_std", float("nan"))
+            print(f"  {mk}: mean={mean_v:.4f}, std={std_v:.4f}")
+
+    # Save global outputs.
+    coarse_csv = run_dir / f"coarse_records_{run_id}.csv"
+    fine_csv = run_dir / f"fine_records_{run_id}.csv"
+    ratio_csv = run_dir / f"ratio_summary_{run_id}.csv"
+    summary_json = run_dir / f"summary_{run_id}.json"
+    summary_txt = run_dir / f"summary_{run_id}.txt"
+
+    save_records_csv(coarse_records, str(coarse_csv))
+    save_records_csv(fine_records, str(fine_csv))
+    save_records_csv(ratio_summary_records, str(ratio_csv))
+
+    summary_payload = {
+        "run_id": run_id,
+        "device": config.device,
+        "train_ratios": config.train_ratios,
+        "seed_list": config.seed_list,
+        "coarse_search_size": len(config.coarse_param_grid()),
+        "coarse_records_csv": str(coarse_csv),
+        "fine_records_csv": str(fine_csv),
+        "ratio_summary_csv": str(ratio_csv),
+        "ratio_summaries": ratio_summary_records,
+    }
+    save_json(summary_payload, str(summary_json))
+    save_metrics_text(summary_payload, str(summary_txt))
+
+    print("\n" + "=" * 88)
+    print("WDCNN experiment pipeline finished")
+    print(f"Summary JSON: {summary_json}")
+    print("=" * 88)
 
 
 if __name__ == "__main__":
