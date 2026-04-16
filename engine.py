@@ -52,7 +52,7 @@ def create_run_id(result_dir: str) -> tuple[str, Path]:
 
 
 def selection_tuple(metrics: dict[str, float]) -> tuple[float, float, float, float, float]:
-    """Primary then tie-break: AUC -> Recall -> MAP@100 -> MAP@200 -> Precision."""
+    """主排序及平分规则：AUC -> Recall -> MAP@100 -> MAP@200 -> Precision。"""
 
     def _safe(v: float) -> float:
         if v is None or (isinstance(v, float) and np.isnan(v)):
@@ -235,6 +235,7 @@ def train_wdcnn_model(
     scheduler_patience: int,
     min_lr: float,
     checkpoint_path: str,
+    scheduler_total_epochs: int | None = None,
     threshold_metric: str = "f1",
     fixed_val_threshold: float | None = None,
     use_cosine_schedule: bool = False,
@@ -242,6 +243,7 @@ def train_wdcnn_model(
     grad_clip_norm: float | None = None,
     pos_weight_scale: float = 1.0,
     precision_floor: float | None = None,
+    chinese_log: bool = True,
 ) -> TrainingOutput:
     train_labels = []
     for _, _, y in train_loader:
@@ -256,7 +258,7 @@ def train_wdcnn_model(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler_mode = "plateau"
     if use_cosine_schedule:
-        total_epochs = max(int(max_epochs), 1)
+        total_epochs = max(int(scheduler_total_epochs if scheduler_total_epochs is not None else max_epochs), 1)
         warm = max(int(warmup_epochs), 0)
         base_lr = max(float(lr), 1e-12)
         min_factor = float(np.clip(min_lr / base_lr, 0.0, 1.0))
@@ -295,9 +297,6 @@ def train_wdcnn_model(
         "val_precision": [],
         "train_recall": [],
         "val_recall": [],
-        "train_f1": [],
-        "val_f1": [],
-        "val_threshold": [],
         "lr": [],
     }
 
@@ -350,19 +349,26 @@ def train_wdcnn_model(
         history["val_precision"].append(val_metrics["precision"])
         history["train_recall"].append(train_metrics["recall"])
         history["val_recall"].append(val_metrics["recall"])
-        history["train_f1"].append(train_metrics["f1"])
-        history["val_f1"].append(val_metrics["f1"])
-        history["val_threshold"].append(val_threshold)
         history["lr"].append(float(optimizer.param_groups[0]["lr"]))
 
-        print(
-            f"[WDCNN] Epoch {epoch:03d} | "
-            f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} | "
-            f"val_auc={val_metrics['auc']:.4f} val_map100={val_metrics['map100']:.4f} "
-            f"val_map200={val_metrics['map200']:.4f} val_recall={val_metrics['recall']:.4f} "
-            f"val_precision={val_metrics['precision']:.4f} thr={val_threshold:.2f} "
-            f"lr={optimizer.param_groups[0]['lr']:.6f}"
-        )
+        if chinese_log:
+            print(
+                f"[WDCNN] 第 {epoch:03d} 轮 | "
+                f"训练损失={train_loss:.4f} 验证损失={val_loss:.4f} | "
+                f"验证AUC={val_metrics['auc']:.4f} 验证MAP@100={val_metrics['map100']:.4f} "
+                f"验证MAP@200={val_metrics['map200']:.4f} 验证召回率={val_metrics['recall']:.4f} "
+                f"验证精确率={val_metrics['precision']:.4f} 阈值={val_threshold:.2f} "
+                f"学习率={optimizer.param_groups[0]['lr']:.6f}"
+            )
+        else:
+            print(
+                f"[WDCNN] Epoch {epoch:03d} | "
+                f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} | "
+                f"val_auc={val_metrics['auc']:.4f} val_map100={val_metrics['map100']:.4f} "
+                f"val_map200={val_metrics['map200']:.4f} val_recall={val_metrics['recall']:.4f} "
+                f"val_precision={val_metrics['precision']:.4f} thr={val_threshold:.2f} "
+                f"lr={optimizer.param_groups[0]['lr']:.6f}"
+            )
 
         cur_score = selection_tuple(val_metrics)
         if cur_score > best_score:
@@ -376,8 +382,11 @@ def train_wdcnn_model(
         else:
             stale_epochs += 1
 
-        if stale_epochs >= early_stop_patience:
-            print(f"Early stopping at epoch={epoch}, patience={early_stop_patience}")
+        if early_stop_patience > 0 and stale_epochs >= early_stop_patience:
+            if chinese_log:
+                print(f"触发提前停止：当前轮次={epoch}，耐心值={early_stop_patience}")
+            else:
+                print(f"Early stopping at epoch={epoch}, patience={early_stop_patience}")
             break
 
     if best_state is not None:
@@ -447,9 +456,8 @@ def plot_training_history(history: dict[str, list[float]], save_path: str) -> No
     plt.legend(fontsize=8)
 
     plt.subplot(2, 3, 6)
-    plt.plot(epochs, history["val_f1"], label="val_f1")
-    plt.plot(epochs, history["val_threshold"], label="val_threshold")
-    plt.title("Val F1 & Threshold")
+    plt.plot(epochs, history["lr"], label="learning_rate")
+    plt.title("Learning Rate")
     plt.xlabel("Epoch")
     plt.legend()
 
@@ -491,12 +499,13 @@ def plot_topn_precision_curve(y_true: np.ndarray, y_prob: np.ndarray, save_path:
     curve = precision_at_n_curve(y_true, y_prob, max_n=max_n)
     x = np.arange(1, max_n + 1)
     plt.figure(figsize=(7, 5))
-    plt.plot(x, curve)
-    plt.axvline(100, linestyle="--", color="gray", linewidth=1)
-    plt.axvline(200, linestyle="--", color="gray", linewidth=1)
+    plt.plot(x, curve, label="Precision@N")
+    plt.axvline(100, linestyle="--", color="gray", linewidth=1, label="N=100")
+    plt.axvline(200, linestyle="--", color="gray", linewidth=1, label="N=200")
     plt.title("Top-N Precision Curve")
     plt.xlabel("N")
     plt.ylabel("Precision@N")
+    plt.legend()
     plt.tight_layout()
     plt.savefig(save_path, dpi=220, bbox_inches="tight")
     plt.close()

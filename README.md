@@ -1,42 +1,41 @@
+# WDCNN 单配置复现版
 
-# CNN-LG 项目说明
+本项目已简化为“固定参数复现 Stage A(1/18)”流程，目标是稳定复现如下训练设定：
 
-这个版本是在你现有框架思路上，优先补齐 **CNN-LG** 路线的一个可运行版本。
+- 训练比例：`0.80`
+- 随机种子：`42`
+- 模型参数：`a90_b120_g20_r3`（`dropout=0.2`）
+- 训练参数：`lr=4e-4`、`warmup=1`、`train_epochs=7`
+- 学习率轨迹：按 `scheduler_total_epochs=20` 计算余弦调度，但训练在第 7 轮结束
+- 阈值策略：验证集按 `precision>=0.30` 约束选阈值（无可行阈值时回退到 F1 最优阈值）
 
 ## 目录说明
 
-- `config.py`
-  - 统一管理所有超参数和路径
-- `data_process.py`
-  - 负责读数据、缺失值处理、离群值处理、归一化、按周重构、划分数据集
-- `src/models/cnn_lg_model.py`
-  - 负责 CNN 特征提取器与预训练分类头
-- `engine.py`
-  - 负责训练、验证、提特征、训练 LightGBM、画图、保存结果
-- `main_cnn_lg.py`
-  - 总入口
+- `config.py`：固定复现实验参数
+- `data_process.py`：数据预处理与数据集划分
+- `src/models/wdcnn_model.py`：Wide + Deep CNN 模型结构
+- `engine.py`：训练、评估、指标与绘图
+- `main_smooth_best.py`：唯一实验入口
 
 ## 运行方式
 
-先进入项目根目录，然后运行：
+在项目根目录执行：
 
 ```bash
-python main_cnn_lg.py
+python main_smooth_best.py
 ```
 
-## 数据格式要求
+## 输出产物
 
-数据文件应至少包含：
+运行后会在 `results/repro_stageA001/run_*/` 生成：
 
-- `CONS_NO`：用户编号
-- `FLAG`：标签（0=正常，1=窃电）
-- 其余列：日期列，例如 `2014-01-01`
+- `checkpoint`
+- 训练曲线图 `history`
+- ROC/PR/TopN 图
+- `metrics_*.json/.txt`
+- `summary_*.json/.txt`
 
-## 和你原版代码相比，主要改动
+## 说明
 
-1. 不再直接把一维序列喂给 LSTM，而是先完成论文要求的 CNN-LG
-2. 评价指标改为更适合不平衡分类的 Precision / Recall / F1 / ROC-AUC / PR-AUC
-3. 训练时显式处理类别不平衡，不再只看 Accuracy
-4. 数据重构为 `147×7` 周矩阵，更接近论文输入结构
-5. CNN 和 LightGBM 解耦，符合“先提特征，再分类”的 CNN-LG 思路
-6. 增加了训练曲线、指标保存、模型保存，方便写毕业论文
+- 控制台日志与关键说明已改为中文。
+- 历史 `checkpoints/results` 产物保留，不会被删除。

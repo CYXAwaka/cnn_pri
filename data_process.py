@@ -136,8 +136,8 @@ def _print_data_report(name: str, y: np.ndarray, day_count: int, week_count: int
     neg = int(np.sum(y == 0))
     print("=" * 72)
     print(f"{name}")
-    print(f"samples={total}, normal={neg}, theft={pos}, pos_rate={pos / max(total, 1):.4f}")
-    print(f"day_count={day_count}, week_count={week_count}, padded_days={padded_days}")
+    print(f"样本数={total}, 正常用户={neg}, 窃电用户={pos}, 正样本占比={pos / max(total, 1):.4f}")
+    print(f"天数长度={day_count}, 周数={week_count}, 补齐天数={padded_days}")
     print("=" * 72)
 
 
@@ -189,7 +189,7 @@ def preprocess_for_wdcnn(
         padded_days=padded_days,
     )
     _print_data_report(
-        name="Paper-aligned preprocess completed",
+        name="论文对齐预处理完成",
         y=dataset.y,
         day_count=dataset.day_count,
         week_count=dataset.week_count,
@@ -281,16 +281,13 @@ def split_dataset_for_ratio(
     )
 
     _print_data_report(
-        name=f"Split ready (train_ratio={train_ratio:.2f}, seed={random_state})",
+        name=f"数据划分完成（训练比例={train_ratio:.2f}，随机种子={random_state}）",
         y=np.concatenate([split.y_train, split.y_val, split.y_test]),
         day_count=dataset.day_count,
         week_count=dataset.week_count,
         padded_days=dataset.padded_days,
     )
-    print(
-        "split sizes => "
-        f"train={len(split.y_train)}, val={len(split.y_val)}, test={len(split.y_test)}"
-    )
+    print(f"划分规模 => 训练集={len(split.y_train)}, 验证集={len(split.y_val)}, 测试集={len(split.y_test)}")
     return split
 
 

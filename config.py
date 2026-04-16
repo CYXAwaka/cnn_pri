@@ -1,27 +1,25 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-from dataclasses import dataclass, field
-from itertools import product
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import torch
 
 
 @dataclass
 class Config:
-    """Global experiment config for paper-aligned WDCNN."""
+    """Single-run reproduction config for WDCNN."""
 
     # Paths
     data_path: str = "data/raw/data.csv"
-    checkpoint_dir: str = "checkpoints"
-    result_dir: str = "results"
+    checkpoint_dir: str = "checkpoints/repro_stageA001"
+    result_dir: str = "results/repro_stageA001"
 
     # Dataset columns
     id_col: str = "CONS_NO"
     label_col: str = "FLAG"
 
-    # Preprocess (paper-aligned)
+    # Preprocessing
     days_per_week: int = 7
     fill_missing_calendar_days: bool = True
     use_outlier_clip: bool = True
@@ -29,98 +27,49 @@ class Config:
     normalize_eps: float = 1e-8
     week_pad_value: float = 0.0
 
-    # Split and search protocol
-    train_ratios: list[float] = field(default_factory=lambda: [0.5, 0.6, 0.7, 0.8])
+    # Split and seed
+    train_ratio: float = 0.8
     val_ratio_in_train: float = 0.1
-    seed_list: list[int] = field(default_factory=lambda: [42, 52, 62])
+    seed: int = 42
 
-    # WDCNN default params from paper's main setting
-    alpha: int = 90  # wide branch FC width
-    beta: int = 60   # deep branch FC width
-    gamma: int = 15  # deep branch conv channels
-    r_layers: int = 5
+    # Model hyperparameters
+    alpha: int = 90
+    beta: int = 120
+    gamma: int = 20
+    r_layers: int = 3
     dropout: float = 0.2
 
-    # Coarse search space
-    alpha_grid: list[int] = field(default_factory=lambda: [50, 60, 90])
-    beta_grid: list[int] = field(default_factory=lambda: [60, 90, 120])
-    gamma_grid: list[int] = field(default_factory=lambda: [10, 15, 20])
-    r_grid: list[int] = field(default_factory=lambda: [3, 4, 5])
-    refine_top_k: int = 3
-
-    # Optimization
+    # Training hyperparameters
     batch_size: int = 128
-    coarse_max_epochs: int = 20
-    fine_max_epochs: int = 60
-    early_stop_patience: int = 12
-    lr: float = 1e-3
+    lr: float = 4e-4
     weight_decay: float = 1e-4
+    train_epochs: int = 30
+    scheduler_total_epochs: int = 30
+    warmup_epochs: int = 1
+    use_cosine_schedule: bool = True
+    early_stop_patience: int = 0  # <=0 means disabled
     lr_scheduler_factor: float = 0.5
     lr_scheduler_patience: int = 4
     min_lr: float = 1e-6
-
-    # Selection and threshold strategy
-    selection_metric: str = "auc"
+    grad_clip_norm: float = 1.0
+    pos_weight_scale: float = 1.0
+    precision_floor: float = 0.30
     threshold_metric: str = "f1"
 
-    # Runtime and artifact settings
+    # Reference target (for reproduction gap report)
+    target_epoch: int = 7
+    target_val_loss: float = 0.9941
+    target_val_auc: float = 0.8317
+    target_val_recall: float = 0.6436
+
+    # Runtime
     num_workers: int = 0
-    artifact_versioning: str = "timestamp+version"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Resume controls
-    resume_run_id: str = "20260414_190010_v001"
-    resume_skip_existing: bool = True
-    resume_rebuild_metrics: bool = True
-    resume_scan_only: bool = False
-
-    # Best-group smooth retrain controls
-    smooth_target_run_id: str = "20260414_190010_v001"
-    smooth_lr: float = 6e-4
-    smooth_max_epochs: int = 24
-    smooth_early_stop_patience: int = 10
-    smooth_warmup_epochs: int = 3
-    smooth_use_cosine_schedule: bool = True
-    smooth_grad_clip_norm: float = 1.0
-    smooth_fixed_threshold: float | None = 0.73
-    smooth_artifact_suffix: str = "smooth"
-
-    # Smooth-v2 (AUC first, Recall second, Precision floor) search controls
-    smooth_v1_run_id: str = "20260415_175252_v001"
-    smooth_v2_result_subdir: str = "smooth_v2"
-    smooth_v2_ratio: float = 0.8
-    smooth_v2_param_tag: str = "a90_b120_g20_r3"
-    smooth_v2_precision_floor: float = 0.30
-    smooth_v2_stage_a_lrs: list[float] = field(default_factory=lambda: [4e-4, 6e-4, 8e-4])
-    smooth_v2_stage_a_warmups: list[int] = field(default_factory=lambda: [1, 2, 3])
-    smooth_v2_stage_a_patience: list[int] = field(default_factory=lambda: [6, 8])
-    smooth_v2_stage_a_max_epochs: int = 20
-    smooth_v2_stage_a_top_k: int = 2
-    smooth_v2_stage_b_pos_weight_scales: list[float] = field(default_factory=lambda: [1.0, 1.2, 1.4])
+    chinese_log: bool = False
 
     def make_dirs(self) -> None:
         Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         Path(self.result_dir).mkdir(parents=True, exist_ok=True)
-
-    def coarse_param_grid(self) -> list[dict[str, Any]]:
-        """Cartesian product over alpha/beta/gamma/R for stage-1 search."""
-        grid: list[dict[str, Any]] = []
-        for alpha, beta, gamma, r_layers in product(
-            self.alpha_grid,
-            self.beta_grid,
-            self.gamma_grid,
-            self.r_grid,
-        ):
-            grid.append(
-                {
-                    "alpha": alpha,
-                    "beta": beta,
-                    "gamma": gamma,
-                    "r_layers": r_layers,
-                    "dropout": self.dropout,
-                }
-            )
-        return grid
 
 
 config = Config()
