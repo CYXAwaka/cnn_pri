@@ -23,6 +23,9 @@ from src.models.wdcnn_model import WideDeepCNN
 
 
 def set_global_seed(seed: int) -> None:
+    """
+    固定所有主要随机源，提升实验可复现性。
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -34,6 +37,9 @@ def set_global_seed(seed: int) -> None:
 
 
 def build_model(split) -> WideDeepCNN:
+    """
+    按配置参数构建 WDCNN 模型实例。
+    """
     return WideDeepCNN(
         wide_input_dim=split.wide_input_dim,
         deep_input_shape=split.deep_input_shape,
@@ -46,6 +52,9 @@ def build_model(split) -> WideDeepCNN:
 
 
 def build_repro_gap(history: dict[str, list[float]]) -> dict[str, Any]:
+    """
+    生成“目标日志 vs 实际训练”差异报告（用于复现核对）。
+    """
     if not history.get("val_loss"):
         return {}
 
@@ -76,6 +85,13 @@ def build_repro_gap(history: dict[str, list[float]]) -> dict[str, Any]:
 
 
 def main() -> None:
+    """
+    单配置实验入口：
+    1) 初始化目录与随机种子
+    2) 预处理 + 划分数据
+    3) 训练并保存最佳权重
+    4) 在测试集评估并输出图表/报告
+    """
     config.make_dirs()
     set_global_seed(config.seed)
 
@@ -100,6 +116,7 @@ def main() -> None:
     )
     print("=" * 88)
 
+    # 预处理：得到 1D + 2D 双输入。
     dataset = preprocess_for_wdcnn(
         file_path=config.data_path,
         id_col=config.id_col,
@@ -112,6 +129,7 @@ def main() -> None:
         week_pad_value=config.week_pad_value,
     )
 
+    # 分层划分：train / val / test。
     split = split_dataset_for_ratio(
         dataset=dataset,
         train_ratio=config.train_ratio,
@@ -124,6 +142,7 @@ def main() -> None:
     model = build_model(split).to(config.device)
     ckpt_path = checkpoint_dir / f"wdcnn_{run_id}_seed{config.seed}.pth"
 
+    # 训练主循环（自动保存最佳 checkpoint）。
     train_out = train_wdcnn_model(
         model=model,
         train_loader=split.train_loader,
@@ -148,6 +167,7 @@ def main() -> None:
         chinese_log=config.chinese_log,
     )
 
+    # 注意：测试集使用“验证阶段选出的最佳阈值”进行统计。
     test_metrics, y_test, p_test = evaluate_wdcnn_model(
         model=train_out.model,
         dataloader=split.test_loader,
@@ -155,6 +175,7 @@ def main() -> None:
         threshold=train_out.best_threshold,
     )
 
+    # 统一产物命名。
     history_path = run_dir / f"history_{run_id}.png"
     roc_path = run_dir / f"roc_{run_id}.png"
     pr_path = run_dir / f"pr_{run_id}.png"
@@ -164,12 +185,14 @@ def main() -> None:
     summary_json_path = run_dir / f"summary_{run_id}.json"
     summary_txt_path = run_dir / f"summary_{run_id}.txt"
 
+    # 绘制结果图。
     plot_training_history(train_out.history, str(history_path))
     plot_roc_pr_curves(y_test, p_test, str(roc_path), str(pr_path))
     plot_topn_precision_curve(y_test, p_test, str(topn_path), max_n=200)
 
     repro_gap = build_repro_gap(train_out.history)
 
+    # 详细指标报告（机器可读）
     metrics_payload = {
         "run_id": run_id,
         "stage": "single_repro",
@@ -210,6 +233,7 @@ def main() -> None:
     save_json(metrics_payload, str(metrics_json_path))
     save_metrics_text(metrics_payload, str(metrics_txt_path))
 
+    # 摘要报告（人工快速查看）
     summary_payload = {
         "run_id": run_id,
         "message": "single-run training finished",

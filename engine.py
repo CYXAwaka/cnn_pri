@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import copy
 import csv
@@ -27,6 +27,17 @@ from sklearn.metrics import (
 
 @dataclass
 class TrainingOutput:
+    """
+    训练结果容器。
+
+    - model: 已加载最佳权重的模型
+    - history: 每轮训练/验证历史
+    - best_val_metrics: 最佳轮次对应的验证指标
+    - best_threshold: 最佳轮次选择到的阈值
+    - best_epoch: 最佳轮次编号（1-based）
+    - checkpoint_path: 最佳权重保存路径
+    """
+
     model: nn.Module
     history: dict[str, list[float]]
     best_val_metrics: dict[str, float]
@@ -36,7 +47,12 @@ class TrainingOutput:
 
 
 def create_run_id(result_dir: str) -> tuple[str, Path]:
-    """Create unique run id: YYYYMMDD_HHMMSS_vNNN and run directory."""
+    """
+    创建唯一 run_id 与对应目录。
+
+    命名规则：
+    YYYYMMDD_HHMMSS_vNNN
+    """
     base_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     result_path = Path(result_dir)
     result_path.mkdir(parents=True, exist_ok=True)
@@ -52,7 +68,10 @@ def create_run_id(result_dir: str) -> tuple[str, Path]:
 
 
 def selection_tuple(metrics: dict[str, float]) -> tuple[float, float, float, float, float]:
-    """主排序及平分规则：AUC -> Recall -> MAP@100 -> MAP@200 -> Precision。"""
+    """
+    统一排序规则（越大越好）：
+    AUC -> Recall -> MAP@100 -> MAP@200 -> Precision
+    """
 
     def _safe(v: float) -> float:
         if v is None or (isinstance(v, float) and np.isnan(v)):
@@ -69,7 +88,15 @@ def selection_tuple(metrics: dict[str, float]) -> tuple[float, float, float, flo
 
 
 def map_at_n(y_true: np.ndarray, y_prob: np.ndarray, n: int) -> float:
-    """Paper MAP@N definition using P@k over positive positions inside top-N."""
+    """
+    计算 MAP@N（Top-N 内平均精确率）。
+
+    实现逻辑：
+    1) 按预测分数降序排序
+    2) 截取前 N
+    3) 在前 N 中找到每个正样本出现位置，计算对应 P@k
+    4) 对这些 P@k 取平均
+    """
     if len(y_true) == 0:
         return 0.0
     n = min(int(n), len(y_true))
@@ -89,6 +116,11 @@ def map_at_n(y_true: np.ndarray, y_prob: np.ndarray, n: int) -> float:
 
 
 def precision_at_n_curve(y_true: np.ndarray, y_prob: np.ndarray, max_n: int = 200) -> np.ndarray:
+    """
+    计算 Precision@N 曲线（N=1..max_n）。
+
+    返回长度固定为 max_n；当样本量不足时使用尾值补齐。
+    """
     if len(y_true) == 0:
         return np.zeros(max_n, dtype=np.float32)
 
@@ -105,6 +137,15 @@ def precision_at_n_curve(y_true: np.ndarray, y_prob: np.ndarray, max_n: int = 20
 
 
 def compute_binary_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> dict[str, float]:
+    """
+    在给定阈值下计算二分类核心指标。
+
+    输出包含：
+    - precision / recall / f1
+    - auc（基于连续分数）
+    - map100 / map200
+    - 混淆矩阵四格 tn/fp/fn/tp
+    """
     y_true = y_true.astype(int)
     y_pred = (y_prob >= threshold).astype(int)
 
@@ -131,6 +172,14 @@ def compute_binary_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: fl
 
 
 def select_best_threshold(y_true: np.ndarray, y_prob: np.ndarray, metric: str = "f1") -> float:
+    """
+    按单一指标在候选阈值上搜索最优阈值。
+
+    metric 可选：
+    - "recall"
+    - "precision"
+    - 其他值默认按 f1
+    """
     candidates = np.linspace(0.05, 0.95, 91)
     best_thr = 0.5
     best_score = -1.0
@@ -157,7 +206,12 @@ def select_threshold_with_precision_floor(
     precision_floor: float,
     fallback_metric: str = "f1",
 ) -> float:
-    """Pick threshold by max Recall under Precision floor; fallback to metric-optimal threshold."""
+    """
+    约束阈值搜索：
+    - 在 precision >= floor 的候选阈值中，优先选 recall 最大；
+    - recall 相同时，选 f1 更高；
+    - 若无任何候选满足约束，回退到 fallback_metric 最优阈值。
+    """
     candidates = np.linspace(0.05, 0.95, 91)
     eligible: list[tuple[float, float, float, float]] = []  # recall, f1, precision, threshold
 
@@ -184,6 +238,13 @@ def _run_epoch(
     optimizer=None,
     grad_clip_norm: float | None = None,
 ) -> tuple[float, np.ndarray, np.ndarray]:
+    """
+    执行一个 epoch（训练或验证）。
+
+    判定规则：
+    - optimizer 不为 None -> 训练模式
+    - optimizer 为 None -> 验证/测试模式
+    """
     is_train = optimizer is not None
     if is_train:
         model.train()
@@ -245,6 +306,16 @@ def train_wdcnn_model(
     precision_floor: float | None = None,
     chinese_log: bool = True,
 ) -> TrainingOutput:
+    """
+    模型训练主循环。
+
+    关键点：
+    - 损失函数：BCEWithLogitsLoss(pos_weight) 处理类别不平衡
+    - 阈值：每轮基于验证集搜索（或固定阈值）
+    - 选优：按 selection_tuple 比较当前轮与历史最佳
+    - 早停：仅当 early_stop_patience > 0 时启用
+    """
+    # 统计训练集正负样本，用于动态计算 pos_weight。
     train_labels = []
     for _, _, y in train_loader:
         train_labels.extend(y.numpy().tolist())
@@ -256,6 +327,8 @@ def train_wdcnn_model(
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # 支持两类学习率调度：cosine / plateau。
     scheduler_mode = "plateau"
     if use_cosine_schedule:
         total_epochs = max(int(scheduler_total_epochs if scheduler_total_epochs is not None else max_epochs), 1)
@@ -266,6 +339,7 @@ def train_wdcnn_model(
         def _lr_lambda(epoch_zero_idx: int) -> float:
             ep = epoch_zero_idx + 1
             if warm > 0 and ep <= warm:
+                # warmup 从 0.25*lr 线性升到 1.0*lr
                 return 0.25 + 0.75 * (ep / float(warm))
 
             progress = (ep - warm) / float(max(total_epochs - warm, 1))
@@ -284,6 +358,7 @@ def train_wdcnn_model(
             min_lr=min_lr,
         )
 
+    # 历史记录：用于可视化与后验分析。
     history: dict[str, list[float]] = {
         "train_loss": [],
         "val_loss": [],
@@ -318,6 +393,7 @@ def train_wdcnn_model(
         )
         val_loss, y_val, p_val = _run_epoch(model, val_loader, criterion, device, optimizer=None)
 
+        # 验证阈值策略：固定阈值 > precision_floor 约束搜索 > 单指标搜索。
         if fixed_val_threshold is not None:
             val_threshold = float(fixed_val_threshold)
         elif precision_floor is not None:
@@ -329,9 +405,12 @@ def train_wdcnn_model(
             )
         else:
             val_threshold = select_best_threshold(y_val, p_val, metric=threshold_metric)
+
+        # 注意：train 指标固定用 0.5 阈值，val 指标用搜索得到的阈值。
         train_metrics = compute_binary_metrics(y_train, p_train, threshold=0.5)
         val_metrics = compute_binary_metrics(y_val, p_val, threshold=val_threshold)
 
+        # 学习率更新时机：每轮末更新一次。
         if scheduler_mode == "cosine":
             scheduler.step()
         else:
@@ -351,6 +430,7 @@ def train_wdcnn_model(
         history["val_recall"].append(val_metrics["recall"])
         history["lr"].append(float(optimizer.param_groups[0]["lr"]))
 
+        # 日志支持中英文切换，方便不同展示场景。
         if chinese_log:
             print(
                 f"[WDCNN] 第 {epoch:03d} 轮 | "
@@ -370,6 +450,7 @@ def train_wdcnn_model(
                 f"lr={optimizer.param_groups[0]['lr']:.6f}"
             )
 
+        # 以验证集排序规则决定是否刷新最佳权重。
         cur_score = selection_tuple(val_metrics)
         if cur_score > best_score:
             best_score = cur_score
@@ -382,6 +463,7 @@ def train_wdcnn_model(
         else:
             stale_epochs += 1
 
+        # 早停开关：patience <= 0 时关闭。
         if early_stop_patience > 0 and stale_epochs >= early_stop_patience:
             if chinese_log:
                 print(f"触发提前停止：当前轮次={epoch}，耐心值={early_stop_patience}")
@@ -389,6 +471,7 @@ def train_wdcnn_model(
                 print(f"Early stopping at epoch={epoch}, patience={early_stop_patience}")
             break
 
+    # 训练结束后回载最佳权重，再返回。
     if best_state is not None:
         model.load_state_dict(best_state)
 
@@ -404,6 +487,9 @@ def train_wdcnn_model(
 
 @torch.no_grad()
 def evaluate_wdcnn_model(model: nn.Module, dataloader, device: str, threshold: float) -> tuple[dict[str, float], np.ndarray, np.ndarray]:
+    """
+    在给定阈值下评估数据集（通常用于测试集）。
+    """
     criterion = nn.BCEWithLogitsLoss()
     loss, y_true, y_prob = _run_epoch(model, dataloader, criterion, device, optimizer=None)
     metrics = compute_binary_metrics(y_true, y_prob, threshold=threshold)
@@ -412,6 +498,15 @@ def evaluate_wdcnn_model(model: nn.Module, dataloader, device: str, threshold: f
 
 
 def plot_training_history(history: dict[str, list[float]], save_path: str) -> None:
+    """
+    绘制训练过程汇总图：
+    - Loss
+    - AUC
+    - MAP@100
+    - MAP@200
+    - Recall & Precision
+    - Learning Rate
+    """
     epochs = np.arange(1, len(history["train_loss"]) + 1)
     if len(epochs) == 0:
         return
@@ -467,6 +562,9 @@ def plot_training_history(history: dict[str, list[float]], save_path: str) -> No
 
 
 def plot_roc_pr_curves(y_true: np.ndarray, y_prob: np.ndarray, roc_path: str, pr_path: str) -> None:
+    """
+    绘制并保存 ROC / PR 曲线。
+    """
     fpr, tpr, _ = roc_curve(y_true, y_prob)
     roc_auc = auc(fpr, tpr)
 
@@ -496,6 +594,9 @@ def plot_roc_pr_curves(y_true: np.ndarray, y_prob: np.ndarray, roc_path: str, pr
 
 
 def plot_topn_precision_curve(y_true: np.ndarray, y_prob: np.ndarray, save_path: str, max_n: int = 200) -> None:
+    """
+    绘制 Top-N Precision 曲线。
+    """
     curve = precision_at_n_curve(y_true, y_prob, max_n=max_n)
     x = np.arange(1, max_n + 1)
     plt.figure(figsize=(7, 5))
@@ -512,10 +613,16 @@ def plot_topn_precision_curve(y_true: np.ndarray, y_prob: np.ndarray, save_path:
 
 
 def save_json(obj: Any, save_path: str) -> None:
+    """
+    以 UTF-8 编码保存 JSON 文件。
+    """
     Path(save_path).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def save_metrics_text(metrics: dict[str, Any], save_path: str) -> None:
+    """
+    将嵌套指标字典保存为可读 txt。
+    """
     lines: list[str] = []
     for key, value in metrics.items():
         if isinstance(value, dict):
@@ -529,6 +636,9 @@ def save_metrics_text(metrics: dict[str, Any], save_path: str) -> None:
 
 
 def save_records_csv(records: list[dict[str, Any]], save_path: str) -> None:
+    """
+    保存记录列表为 CSV（字段自动并集）。
+    """
     if not records:
         return
 
@@ -541,6 +651,9 @@ def save_records_csv(records: list[dict[str, Any]], save_path: str) -> None:
 
 
 def summarize_metrics(records: list[dict[str, Any]], metric_keys: list[str]) -> dict[str, dict[str, float]]:
+    """
+    对指定指标键做 mean/std 聚合。
+    """
     if not records:
         return {}
     summary: dict[str, dict[str, float]] = {}
